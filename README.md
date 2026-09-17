@@ -2,11 +2,11 @@
 
 Runs stdio MCP servers on this host and exposes each one over Streamable HTTP,
 for an OpenConnector instance (usually in a container) that cannot spawn them
-itself. OpenConnector writes the list of servers to a file; this bridge watches
-that file, starts each server on first use, and answers `POST /<name>`.
+itself. OpenConnector pushes this bridge its server list; the bridge keeps it
+in memory, starts each server on first use, and answers `POST /<name>`.
 
-Protocol details, the file format, and the two-token authentication are
-documented in OpenConnector's `docs/mcp-bridge.md`.
+The protocol, the payload, and how environments are encrypted are documented in
+OpenConnector's `docs/mcp-bridge.md`.
 
 ## Build
 
@@ -14,21 +14,29 @@ documented in OpenConnector's `docs/mcp-bridge.md`.
 go build -o mcp-bridge.exe .
 ```
 
+Linux: `GOOS=linux GOARCH=amd64 go build -o mcp-bridge .`
+
 ## Run
 
 ```
-mcp-bridge.exe -file C:\Users\john\Documents\open-connector\data\mcp-bridge.json -connector http://127.0.0.1:3010
+mcp-bridge.exe -token <token you choose> -key mcp-bridge.key
 ```
 
-| Flag         | Default                 | Meaning                                                              |
-| ------------ | ----------------------- | -------------------------------------------------------------------- |
-| `-file`      | (required)              | Bridge file written by OpenConnector.                                |
-| `-listen`    | `0.0.0.0:7800`          | Address to serve on. Containers reach it via `host.docker.internal`. |
-| `-connector` | `http://127.0.0.1:3010` | OpenConnector base URL, used to fetch a server's environment.        |
-| `-idle`      | `30m`                   | Stop a server after this long without requests; `0` keeps them.      |
-| `-poll`      | `1s`                    | How often the bridge file is checked for changes.                    |
+On first start it generates a key pair, stores the private key in the `-key`
+file, and prints the public key. Paste the token and that public key into the
+`mcp_bridge` connection in OpenConnector, together with the URL the container
+reaches this bridge at (`http://host.docker.internal:7800` on Docker Desktop).
 
-`GET /health` lists the servers currently defined.
+| Flag      | Default          | Meaning                                                              |
+| --------- | ---------------- | -------------------------------------------------------------------- |
+| `-token`  | (required)       | Bridge token; the same value goes into the OpenConnector connection. |
+| `-key`    | `mcp-bridge.key` | Private key file, created on first start. The only thing kept on disk. |
+| `-listen` | `0.0.0.0:7800`   | Address to serve on.                                                 |
+| `-idle`   | `30m`            | Stop a server after this long without requests; `0` keeps them.      |
 
-Set `OOMOL_CONNECT_MCP_BRIDGE_URL=http://host.docker.internal:7800` on the
-OpenConnector side so it knows where to find this bridge.
+Endpoints (all require `Authorization: Bearer <token>`):
+
+- `PUT /config` — OpenConnector pushes the server list.
+- `POST /<name>` — Streamable HTTP MCP endpoint of one server. Answers
+  `503 {"error":"unconfigured"}` until a list has been pushed.
+- `GET /health` — public key and the servers currently held.
