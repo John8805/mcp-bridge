@@ -64,15 +64,15 @@ func main() {
 		go b.reapIdle()
 	}
 
-	// A shutdown signal is logged before it is honoured, so an exit always
-	// leaves a trace; an interrupt reaching this process by accident (a child
-	// sharing the console) must not end it silently.
+	// An interrupt is logged before it is honoured, so an exit always leaves
+	// a trace, and the servers are stopped first so none is left orphaned.
 	go func() {
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, os.Interrupt)
-		for sig := range signals {
-			logf("ignoring %v; stop the bridge by ending the process", sig)
-		}
+		sig := <-signals
+		logf("received %v; stopping servers and exiting", sig)
+		b.stopAll()
+		os.Exit(0)
 	}()
 
 	mux := http.NewServeMux()
@@ -144,6 +144,21 @@ func (b *bridge) apply(payload bridgePayload) {
 		if _, exists := b.engines[name]; !exists {
 			b.engines[name] = newEngine(name, entry)
 		}
+	}
+}
+
+// stopAll ends every running server, waiting for each.
+func (b *bridge) stopAll() {
+	b.mu.Lock()
+	engines := make([]*engine, 0, len(b.engines))
+	for _, eng := range b.engines {
+		engines = append(engines, eng)
+	}
+	b.mu.Unlock()
+	for _, eng := range engines {
+		eng.mu.Lock()
+		eng.stop()
+		eng.mu.Unlock()
 	}
 }
 
