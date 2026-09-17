@@ -49,15 +49,15 @@ func newEngine(name string, entry serverEntry) *engine {
 	return &engine{name: name, entry: entry}
 }
 
-// ensureStarted spawns the child if it is not running, fetching its
-// environment through fetchEnv first. initParams are the client's initialize
-// params when the spawn is caused by an initialize request; otherwise the
-// bridge initializes with its own.
-func (e *engine) ensureStarted(fetchEnv func() (map[string]string, error), initParams json.RawMessage) error {
+// ensureStarted spawns the child if it is not running, decrypting its
+// environment through decryptEnv first. initParams are the client's
+// initialize params when the spawn is caused by an initialize request;
+// otherwise the bridge initializes with its own.
+func (e *engine) ensureStarted(decryptEnv func() (map[string]string, error), initParams json.RawMessage) error {
 	if e.running() {
 		return nil
 	}
-	env, err := fetchEnv()
+	env, err := decryptEnv()
 	if err != nil {
 		return fmt.Errorf("environment for %s: %w", e.name, err)
 	}

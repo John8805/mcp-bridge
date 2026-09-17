@@ -1,90 +1,123 @@
 // mcp-bridge runs stdio MCP servers on this host and exposes each one over
 // Streamable HTTP for an OpenConnector instance that cannot spawn them itself.
 //
-// OpenConnector writes the list of servers to a file this bridge watches (see
-// docs/mcp-bridge.md in the OpenConnector repository). Each server answers at
-// POST /<name>. Before spawning a server the bridge asks OpenConnector for the
-// server's environment, presenting the file's token and the request token
-// OpenConnector attached to the request that needs the server.
+// OpenConnector pushes the list of servers to PUT /config and reaches each
+// server at POST /<name>, both with the bridge token. The list lives in
+// memory only; until one arrives every server endpoint answers 503 with
+// {"error":"unconfigured"}, which OpenConnector treats as "push again". A
+// server's environment arrives encrypted to this bridge's key, the one thing
+// the bridge keeps on disk, and is decrypted when the server is spawned.
 package main
 
 import (
+	"crypto/ecdh"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
-const requestTokenHeader = "X-Open-Connector-Request-Token"
-
 type bridge struct {
-	connectorURL string
-	idleTimeout  time.Duration
-	client       *http.Client
+	token       string
+	key         *ecdh.PrivateKey
+	idleTimeout time.Duration
 
-	mu      sync.Mutex
-	token   string
-	engines map[string]*engine
-	watcher *fileWatcher
+	mu         sync.Mutex
+	configured bool
+	engines    map[string]*engine
 }
 
 func main() {
 	var (
-		filePath     = flag.String("file", "", "bridge file written by OpenConnector (required)")
-		listen       = flag.String("listen", "0.0.0.0:7800", "address to serve on")
-		connectorURL = flag.String("connector", "http://127.0.0.1:3010", "OpenConnector base URL, for environment lookups")
-		idle         = flag.Duration("idle", 30*time.Minute, "stop a server after this long without requests (0 keeps them)")
-		poll         = flag.Duration("poll", time.Second, "how often to check the bridge file")
+		listen  = flag.String("listen", "0.0.0.0:7800", "address to serve on")
+		token   = flag.String("token", "", "bridge token, the same value entered in OpenConnector's MCP Bridge connection (required)")
+		keyPath = flag.String("key", "mcp-bridge.key", "file holding this bridge's private key; created on first start")
+		idle    = flag.Duration("idle", 30*time.Minute, "stop a server after this long without requests (0 keeps them)")
 	)
 	flag.Parse()
-	if *filePath == "" {
-		fmt.Fprintln(os.Stderr, "mcp-bridge: -file is required")
+	if *token == "" {
+		fmt.Fprintln(os.Stderr, "mcp-bridge: -token is required")
 		flag.Usage()
 		os.Exit(2)
 	}
-
-	b := &bridge{
-		connectorURL: strings.TrimRight(*connectorURL, "/"),
-		idleTimeout:  *idle,
-		client:       &http.Client{Timeout: 15 * time.Second},
-		engines:      map[string]*engine{},
+	key, created, err := loadOrCreateKey(*keyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mcp-bridge:", err)
+		os.Exit(1)
 	}
-	b.watcher = newFileWatcher(*filePath, b.apply)
-	go b.watcher.run(*poll)
+	if created {
+		logf("generated a new key pair in %s", *keyPath)
+	}
+	logf("public key (paste into the MCP Bridge connection): %s", publicKeyString(key))
+
+	b := &bridge{token: *token, key: key, idleTimeout: *idle, engines: map[string]*engine{}}
 	if *idle > 0 {
 		go b.reapIdle()
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "servers": b.serverNames()})
-	})
-	mux.HandleFunc("/{name}", b.handleServer)
-	logf("listening on http://%s, OpenConnector at %s", *listen, b.connectorURL)
+	mux.HandleFunc("GET /health", b.authenticated(b.handleHealth))
+	mux.HandleFunc("PUT /config", b.authenticated(b.handleConfig))
+	mux.HandleFunc("/{name}", b.authenticated(b.handleServer))
+	logf("listening on http://%s", *listen)
 	if err := http.ListenAndServe(*listen, mux); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-// apply installs a freshly read bridge file: new entries become engines that
+func (b *bridge) authenticated(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !bearerMatches(r.Header.Get("Authorization"), b.token) {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "bridge token mismatch")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (b *bridge) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"publicKey": publicKeyString(b.key),
+		"servers":   b.serverNames(),
+	})
+}
+
+// handleConfig installs a pushed payload: new entries become engines that
 // start on first use, changed entries restart on next use, removed entries
 // stop now.
-func (b *bridge) apply(file bridgeFile) {
+func (b *bridge) handleConfig(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "cannot read body")
+		return
+	}
+	payload, err := parseBridgePayload(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_payload", err.Error())
+		return
+	}
+	b.apply(payload)
+	names := b.serverNames()
+	logf("configuration received: %d server(s) %v", len(names), names)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "servers": names})
+}
+
+func (b *bridge) apply(payload bridgePayload) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.token = file.Token
+	b.configured = true
 	for name, current := range b.engines {
-		entry, keep := file.Servers[name]
+		entry, keep := payload.Servers[name]
 		if keep && entry.equal(current.entry) {
 			continue
 		}
@@ -95,7 +128,7 @@ func (b *bridge) apply(file bridgeFile) {
 			current.stop()
 		}(current)
 	}
-	for name, entry := range file.Servers {
+	for name, entry := range payload.Servers {
 		if _, exists := b.engines[name]; !exists {
 			b.engines[name] = newEngine(name, entry)
 		}
@@ -109,13 +142,14 @@ func (b *bridge) serverNames() []string {
 	for name := range b.engines {
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }
 
-func (b *bridge) lookup(name string) (*engine, string) {
+func (b *bridge) lookup(name string) (*engine, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.engines[name], b.token
+	return b.engines[name], b.configured
 }
 
 // handleServer is one Streamable HTTP endpoint (protocol revision 2026-07-28:
@@ -124,42 +158,30 @@ func (b *bridge) lookup(name string) (*engine, string) {
 // handshake the bridge already performed, forwarded to the server.
 func (b *bridge) handleServer(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	eng, token := b.lookup(name)
-	if eng == nil {
-		// OpenConnector writes the file and calls the bridge right away, so a
-		// name the last poll did not know may already be on disk.
-		b.watcher.check()
-		eng, token = b.lookup(name)
-	}
-	if token == "" {
-		writeError(w, http.StatusServiceUnavailable, "bridge file not loaded yet")
-		return
-	}
-	if !bearerMatches(r.Header.Get("Authorization"), token) {
-		writeError(w, http.StatusUnauthorized, "bridge token mismatch")
+	eng, configured := b.lookup(name)
+	if !configured {
+		writeError(w, http.StatusServiceUnavailable, "unconfigured", "the bridge has not received its server list yet")
 		return
 	}
 	if eng == nil {
-		writeError(w, http.StatusNotFound, "no such server: "+name)
+		writeError(w, http.StatusNotFound, "not_found", "no such server: "+name)
 		return
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
-		writeError(w, http.StatusMethodNotAllowed, "this bridge serves POST only")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "this bridge serves POST only")
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "cannot read body")
+		writeError(w, http.StatusBadRequest, "invalid_body", "cannot read body")
 		return
 	}
 	var message jsonRPCMessage
 	if err := json.Unmarshal(body, &message); err != nil || message.JSONRPC != "2.0" {
-		writeError(w, http.StatusBadRequest, "body must be one JSON-RPC 2.0 message")
+		writeError(w, http.StatusBadRequest, "invalid_body", "body must be one JSON-RPC 2.0 message")
 		return
 	}
-	requestToken := r.Header.Get(requestTokenHeader)
-	fetchEnv := func() (map[string]string, error) { return b.fetchEnvironment(name, token, requestToken, eng.entry.Env) }
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()
@@ -168,16 +190,17 @@ func (b *bridge) handleServer(w http.ResponseWriter, r *http.Request) {
 	if message.Method == "initialize" {
 		initParams = message.Params
 	}
-	if err := eng.ensureStarted(fetchEnv, initParams); err != nil {
+	decrypt := func() (map[string]string, error) { return decryptEnv(b.key, name, eng.entry) }
+	if err := eng.ensureStarted(decrypt, initParams); err != nil {
 		logf("%s: %v", name, err)
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, http.StatusBadGateway, "spawn_failed", err.Error())
 		return
 	}
 	switch {
 	case message.isNotification():
 		if message.Method != "notifications/initialized" {
 			if err := eng.notify(message.Method, message.Params); err != nil {
-				writeError(w, http.StatusBadGateway, err.Error())
+				writeError(w, http.StatusBadGateway, "server_failed", err.Error())
 				return
 			}
 		}
@@ -186,7 +209,7 @@ func (b *bridge) handleServer(w http.ResponseWriter, r *http.Request) {
 		response, err := eng.relay(message)
 		if err != nil {
 			logf("%s: %v", name, err)
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, http.StatusBadGateway, "server_failed", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, response)
@@ -195,41 +218,6 @@ func (b *bridge) handleServer(w http.ResponseWriter, r *http.Request) {
 		// never forwards those, so nothing is waiting for it.
 		w.WriteHeader(http.StatusAccepted)
 	}
-}
-
-// fetchEnvironment asks OpenConnector for the server's environment values.
-// Skipped entirely when the entry names no variables, so a server with no
-// secrets starts even from a request that carries no request token.
-func (b *bridge) fetchEnvironment(name, token, requestToken string, names []string) (map[string]string, error) {
-	if len(names) == 0 {
-		return map[string]string{}, nil
-	}
-	if requestToken == "" {
-		return nil, errors.New("the request carries no " + requestTokenHeader + " header, so the environment cannot be fetched")
-	}
-	endpoint := b.connectorURL + "/api/mcp-bridge/servers/" + url.PathEscape(name) + "/env"
-	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set(requestTokenHeader, requestToken)
-	response, err := b.client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return nil, fmt.Errorf("OpenConnector answered %d: %s", response.StatusCode, strings.TrimSpace(string(detail)))
-	}
-	var payload struct {
-		Env map[string]string `json:"env"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("OpenConnector answered with invalid JSON: %w", err)
-	}
-	return payload.Env, nil
 }
 
 // reapIdle stops servers nobody has used for idleTimeout. They restart on
@@ -270,8 +258,8 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]any{"error": message})
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{"error": code, "message": message})
 }
 
 var logger = log.New(os.Stderr, "", log.LstdFlags)
