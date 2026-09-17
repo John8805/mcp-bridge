@@ -87,6 +87,7 @@ func (e *engine) start(env map[string]string) error {
 	cmd := exec.Command(e.entry.Command, e.entry.Args...)
 	cmd.Dir = e.entry.Cwd
 	cmd.Env = mergeEnvironment(os.Environ(), env)
+	detachFromConsole(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

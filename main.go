@@ -19,6 +19,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
@@ -62,6 +63,17 @@ func main() {
 	if *idle > 0 {
 		go b.reapIdle()
 	}
+
+	// A shutdown signal is logged before it is honoured, so an exit always
+	// leaves a trace; an interrupt reaching this process by accident (a child
+	// sharing the console) must not end it silently.
+	go func() {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, os.Interrupt)
+		for sig := range signals {
+			logf("ignoring %v; stop the bridge by ending the process", sig)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", b.authenticated(b.handleHealth))
