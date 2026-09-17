@@ -34,6 +34,7 @@ type bridge struct {
 	mu      sync.Mutex
 	token   string
 	engines map[string]*engine
+	watcher *fileWatcher
 }
 
 func main() {
@@ -57,7 +58,8 @@ func main() {
 		client:       &http.Client{Timeout: 15 * time.Second},
 		engines:      map[string]*engine{},
 	}
-	go watchBridgeFile(*filePath, *poll, b.apply)
+	b.watcher = newFileWatcher(*filePath, b.apply)
+	go b.watcher.run(*poll)
 	if *idle > 0 {
 		go b.reapIdle()
 	}
@@ -123,6 +125,12 @@ func (b *bridge) lookup(name string) (*engine, string) {
 func (b *bridge) handleServer(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	eng, token := b.lookup(name)
+	if eng == nil {
+		// OpenConnector writes the file and calls the bridge right away, so a
+		// name the last poll did not know may already be on disk.
+		b.watcher.check()
+		eng, token = b.lookup(name)
+	}
 	if token == "" {
 		writeError(w, http.StatusServiceUnavailable, "bridge file not loaded yet")
 		return

@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -49,37 +50,61 @@ func readBridgeFile(path string) (bridgeFile, error) {
 	return file, nil
 }
 
-// watchBridgeFile re-reads the file whenever its modification time changes and
-// hands the new content to apply. A file that fails to parse keeps the
-// previous content in force; a missing file is reported once until it appears.
-func watchBridgeFile(path string, interval time.Duration, apply func(bridgeFile)) {
-	var lastModified time.Time
-	var lastSize int64
-	missing := false
+// fileWatcher re-reads the bridge file whenever its modification time or size
+// changes and hands the new content to apply. It polls on a timer and can
+// also be asked to check right now, which a request for an unknown server
+// does: OpenConnector writes the file and calls the bridge in the same
+// breath, sooner than the next poll.
+type fileWatcher struct {
+	path  string
+	apply func(bridgeFile)
+
+	mu           sync.Mutex
+	lastModified time.Time
+	lastSize     int64
+	missing      bool
+}
+
+func newFileWatcher(path string, apply func(bridgeFile)) *fileWatcher {
+	return &fileWatcher{path: path, apply: apply}
+}
+
+func (w *fileWatcher) run(interval time.Duration) {
 	for {
-		info, err := os.Stat(path)
-		switch {
-		case err != nil:
-			if !missing {
-				logf("bridge file %s: %v (waiting for OpenConnector to write it)", path, err)
-				missing = true
-			}
-		case info.ModTime() != lastModified || info.Size() != lastSize:
-			missing = false
-			lastModified, lastSize = info.ModTime(), info.Size()
-			file, err := readBridgeFile(path)
-			if err != nil {
-				logf("bridge file ignored: %v", err)
-				break
-			}
-			names := make([]string, 0, len(file.Servers))
-			for name := range file.Servers {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			logf("bridge file loaded: %d server(s) %v", len(names), names)
-			apply(file)
-		}
+		w.check()
 		time.Sleep(interval)
 	}
+}
+
+// check reads the file if it changed since the last check. A file that fails
+// to parse keeps the previous content in force; a missing file is reported
+// once until it appears.
+func (w *fileWatcher) check() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	info, err := os.Stat(w.path)
+	if err != nil {
+		if !w.missing {
+			logf("bridge file %s: %v (waiting for OpenConnector to write it)", w.path, err)
+			w.missing = true
+		}
+		return
+	}
+	if info.ModTime() == w.lastModified && info.Size() == w.lastSize {
+		return
+	}
+	w.missing = false
+	w.lastModified, w.lastSize = info.ModTime(), info.Size()
+	file, err := readBridgeFile(w.path)
+	if err != nil {
+		logf("bridge file ignored: %v", err)
+		return
+	}
+	names := make([]string, 0, len(file.Servers))
+	for name := range file.Servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	logf("bridge file loaded: %d server(s) %v", len(names), names)
+	w.apply(file)
 }
