@@ -38,8 +38,8 @@ type bridge struct {
 func main() {
 	var (
 		listen  = flag.String("listen", "0.0.0.0:7800", "address to serve on")
-		token   = flag.String("token", "", "bridge token, the same value entered in OpenConnector's MCP Bridge connection (required)")
-		keyPath = flag.String("key", "mcp-bridge.key", "file holding this bridge's private key; created on first start")
+		token   = flag.String("token", os.Getenv("MCP_BRIDGE_TOKEN"), "bridge token, the same value entered in OpenConnector's MCP Bridge connection (required; or MCP_BRIDGE_TOKEN)")
+		keyPath = flag.String("key", envOr("MCP_BRIDGE_KEY", "mcp-bridge.key"), "file holding this bridge's private key; created on first start (or MCP_BRIDGE_KEY)")
 		idle    = flag.Duration("idle", 30*time.Minute, "stop a server after this long without requests (0 keeps them)")
 	)
 	flag.Parse()
@@ -242,6 +242,13 @@ func (b *bridge) reapIdle() {
 			eng.mu.Unlock()
 		}
 	}
+}
+
+func envOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func bearerMatches(header, token string) bool {
