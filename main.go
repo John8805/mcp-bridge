@@ -11,6 +11,7 @@ package main
 
 import (
 	"crypto/ecdh"
+	"crypto/ed25519"
 	"crypto/subtle"
 	"encoding/json"
 	"flag"
@@ -26,26 +27,37 @@ import (
 	"time"
 )
 
-type bridge struct {
-	token       string
-	key         *ecdh.PrivateKey
-	idleTimeout time.Duration
+const signatureHeader = "X-Open-Connector-Signature"
 
-	mu         sync.Mutex
-	configured bool
-	engines    map[string]*engine
+type bridge struct {
+	token        string
+	key          *ecdh.PrivateKey
+	connectorKey ed25519.PublicKey
+	idleTimeout  time.Duration
+
+	mu           sync.Mutex
+	configured   bool
+	lastIssuedAt int64
+	engines      map[string]*engine
 }
 
 func main() {
 	var (
-		listen  = flag.String("listen", "0.0.0.0:7800", "address to serve on")
-		token   = flag.String("token", os.Getenv("MCP_BRIDGE_TOKEN"), "bridge token, the same value entered in OpenConnector's MCP Bridge connection (required; or MCP_BRIDGE_TOKEN)")
-		keyPath = flag.String("key", envOr("MCP_BRIDGE_KEY", "mcp-bridge.key"), "file holding this bridge's private key; created on first start (or MCP_BRIDGE_KEY)")
-		idle    = flag.Duration("idle", 30*time.Minute, "stop a server after this long without requests (0 keeps them)")
+		listen       = flag.String("listen", "0.0.0.0:7800", "address to serve on")
+		token        = flag.String("token", os.Getenv("MCP_BRIDGE_TOKEN"), "bridge token, the same value entered in OpenConnector's MCP Bridge connection (required; or MCP_BRIDGE_TOKEN)")
+		keyPath      = flag.String("key", envOr("MCP_BRIDGE_KEY", "mcp-bridge.key"), "file holding this bridge's private key; created on first start (or MCP_BRIDGE_KEY)")
+		connectorKey = flag.String("connector-key", os.Getenv("MCP_BRIDGE_CONNECTOR_KEY"), "OpenConnector's push-signing public key, shown on its MCP page (required; or MCP_BRIDGE_CONNECTOR_KEY)")
+		idle         = flag.Duration("idle", 30*time.Minute, "stop a server after this long without requests (0 keeps them)")
 	)
 	flag.Parse()
 	if *token == "" {
 		fmt.Fprintln(os.Stderr, "mcp-bridge: -token is required")
+		flag.Usage()
+		os.Exit(2)
+	}
+	signer, err := parseConnectorKey(*connectorKey)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mcp-bridge:", err)
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -59,7 +71,7 @@ func main() {
 	}
 	logf("public key (paste into the MCP Bridge connection): %s", publicKeyString(key))
 
-	b := &bridge{token: *token, key: key, idleTimeout: *idle, engines: map[string]*engine{}}
+	b := &bridge{token: *token, key: key, connectorKey: signer, idleTimeout: *idle, engines: map[string]*engine{}}
 	if *idle > 0 {
 		go b.reapIdle()
 	}
@@ -118,6 +130,14 @@ func (b *bridge) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_payload", err.Error())
 		return
 	}
+	b.mu.Lock()
+	lastIssuedAt := b.lastIssuedAt
+	b.mu.Unlock()
+	if err := verifyPush(b.connectorKey, body, r.Header.Get(signatureHeader), payload.IssuedAt, lastIssuedAt, time.Now()); err != nil {
+		logf("configuration refused: %v", err)
+		writeError(w, http.StatusForbidden, "bad_signature", err.Error())
+		return
+	}
 	b.apply(payload)
 	names := b.serverNames()
 	logf("configuration received: %d server(s) %v", len(names), names)
@@ -128,6 +148,7 @@ func (b *bridge) apply(payload bridgePayload) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.configured = true
+	b.lastIssuedAt = payload.IssuedAt
 	for name, current := range b.engines {
 		entry, keep := payload.Servers[name]
 		if keep && entry.equal(current.entry) {
