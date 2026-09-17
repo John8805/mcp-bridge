@@ -91,3 +91,7 @@ The pushed body:
   time. `initialize` is answered from the handshake the bridge performed at
   spawn; server-initiated requests (sampling, elicitation) are refused.
 - An interrupt stops every server and exits, logged.
+
+## License
+
+Apache-2.0, the same as OpenConnector.
