@@ -38,6 +38,13 @@ that public key. OpenConnector's signing key is shown on its MCP page.
 | `-key`           | `mcp-bridge.key` | `MCP_BRIDGE_KEY`           | Private key file, created on first start. The only thing kept on disk. |
 | `-listen`        | `0.0.0.0:7800`   |                            | Address to serve on.                                                 |
 | `-idle`          | `30m`            |                            | Stop a server after this long without requests; `0` keeps them.      |
+| `-token-file`         |                  |                            | Read the token from this file instead of `-token`.                   |
+| `-connector-key-file` |                  |                            | Read the signing key from this file instead of `-connector-key`.     |
+| `-log`                | stderr           |                            | Append the log to this file; for launchers that have no console.     |
+
+The `-file` and `-log` flags suit autostart entries (Task Scheduler with a
+`wscript` launcher, systemd, launchd) where secrets should stay out of the
+command line and there is no terminal to log to.
 
 ## Endpoints
 

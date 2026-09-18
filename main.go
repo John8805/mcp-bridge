@@ -43,13 +43,30 @@ type bridge struct {
 
 func main() {
 	var (
-		listen       = flag.String("listen", "0.0.0.0:7800", "address to serve on")
-		token        = flag.String("token", os.Getenv("MCP_BRIDGE_TOKEN"), "bridge token, the same value entered in OpenConnector's MCP Bridge connection (required; or MCP_BRIDGE_TOKEN)")
-		keyPath      = flag.String("key", envOr("MCP_BRIDGE_KEY", "mcp-bridge.key"), "file holding this bridge's private key; created on first start (or MCP_BRIDGE_KEY)")
-		connectorKey = flag.String("connector-key", os.Getenv("MCP_BRIDGE_CONNECTOR_KEY"), "OpenConnector's push-signing public key, shown on its MCP page (required; or MCP_BRIDGE_CONNECTOR_KEY)")
-		idle         = flag.Duration("idle", 30*time.Minute, "stop a server after this long without requests (0 keeps them)")
+		listen           = flag.String("listen", "0.0.0.0:7800", "address to serve on")
+		token            = flag.String("token", os.Getenv("MCP_BRIDGE_TOKEN"), "bridge token, the same value entered in OpenConnector's MCP Bridge connection (required; or MCP_BRIDGE_TOKEN)")
+		keyPath          = flag.String("key", envOr("MCP_BRIDGE_KEY", "mcp-bridge.key"), "file holding this bridge's private key; created on first start (or MCP_BRIDGE_KEY)")
+		connectorKey     = flag.String("connector-key", os.Getenv("MCP_BRIDGE_CONNECTOR_KEY"), "OpenConnector's push-signing public key, shown on its MCP page (required; or MCP_BRIDGE_CONNECTOR_KEY)")
+		idle             = flag.Duration("idle", 30*time.Minute, "stop a server after this long without requests (0 keeps them)")
+		tokenFile        = flag.String("token-file", "", "read the bridge token from this file instead of -token")
+		connectorKeyFile = flag.String("connector-key-file", "", "read OpenConnector's signing key from this file instead of -connector-key")
+		logPath          = flag.String("log", "", "append the log to this file instead of stderr (for launchers without a console)")
 	)
 	flag.Parse()
+	if *logPath != "" {
+		file, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "mcp-bridge:", err)
+			os.Exit(1)
+		}
+		logger.SetOutput(file)
+	}
+	if *tokenFile != "" {
+		*token = readTrimmed(*tokenFile)
+	}
+	if *connectorKeyFile != "" {
+		*connectorKey = readTrimmed(*connectorKeyFile)
+	}
 	if *token == "" {
 		fmt.Fprintln(os.Stderr, "mcp-bridge: -token is required")
 		flag.Usage()
@@ -290,6 +307,16 @@ func (b *bridge) reapIdle() {
 			eng.mu.Unlock()
 		}
 	}
+}
+
+// readTrimmed returns a file's content without surrounding whitespace, or exits with the error.
+func readTrimmed(path string) string {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mcp-bridge:", err)
+		os.Exit(1)
+	}
+	return string(trimSpace(content))
 }
 
 func envOr(name, fallback string) string {
